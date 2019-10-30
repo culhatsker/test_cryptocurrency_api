@@ -1,27 +1,31 @@
-import aiohttp
-import asyncpg
+"""
+Author: Egor Tyuvaev
+
+Starts the background worker that calls the bitfinex API and updates old and
+inserts new records to the database
+
+Database configuration is taken from environment variables, see
+`bc_api.database.get_database_pool` for details.
+"""
+
 import asyncio
-import os
+
 import asyncio_throttle
+import asyncpg
+import aiohttp
 
 from bc_api import bitfinex_api as bfapi
 from bc_api import database as db
 
 
-async def main():
-    db_config = {
-        "user": os.environ.get("PG_USERNAME"),
-        "password": os.environ.get("PG_PASSWORD"),
-        "database": os.environ.get("PG_DATABASE", "bc_api_data"),
-        "host": os.environ.get("PG_HOST", "127.0.0.1")
-    }
-
-    session = aiohttp.ClientSession()
-    db_pool = await db.get_database_pool(db_config)
-
+async def _main(session: aiohttp.ClientSession, db_pool: asyncpg.pool.Pool):
+    """
+    Updates the list of supported currencies in database,
+    updates the currency rates
+    """
     db_currencies = await db.get_currencies(db_pool)
-    db_currencies_set = set([c["name"] for c in db_currencies])
     api_currencies = await bfapi.get_currencies(session)
+    db_currencies_set = {c["name"] for c in db_currencies}
     new_currencies = set(api_currencies) - db_currencies_set
     if new_currencies:
         print("Found new currencies:", ", ".join(new_currencies))
@@ -30,7 +34,7 @@ async def main():
     cur_name_id_mapping = {
         c["name"]: c["id"]
         for c in db_currencies
-    }    
+    }
 
     throttler = asyncio_throttle.Throttler(rate_limit=40, period=60)
 
@@ -44,9 +48,19 @@ async def main():
 
     await asyncio.gather(*map(handle_single_currency, api_currencies))
 
-    await session.close()
-    await db_pool.close()
+
+async def main():
+    """
+    Wraps _main to close db connection and aiohttp session on unhandled
+    exception
+    """
+    db_pool = await db.get_database_pool()
+    session = aiohttp.ClientSession()
+    try:
+        await _main(session, db_pool)
+    finally:
+        await db_pool.close()
+        await session.close()
 
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main())
+asyncio.get_event_loop().run_until_complete(main())
